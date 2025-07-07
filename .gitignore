@@ -19,3 +19,4 @@ releases
 prefixes
 .idea/
 shader**/
+*.hlsl
