@@ -75,13 +75,17 @@ public:
 
   virtual void dump() {
     std::fstream dump_out;
-    dump_out.open("shader_dump_" + hash_.toString() + ".cso",
-                  std::ios::out | std::ios::binary);
+    std::filesystem::create_directories("shader_dump");
+    std::string filename = "shader_dump/main_shader_" + hash_.toString().substr(0, 8) + ".cso";
+    dump_out.open(filename, std::ios::out | std::ios::binary);
+
     if (dump_out) {
       dump_out.write((char *)bytecode, bytecode_length);
+      dump_out.close();
+      WARN("shader dumped to " + filename);
+    } else {
+      ERR("Failed to open file for shader dumping: ", filename);
     }
-    dump_out.close();
-    WARN("shader dumped to ./shader_dump_" + hash_.toString() + ".cso");
   }
 #else
   virtual void dump() {}
