@@ -4,12 +4,15 @@
 #include "dxmt_format.hpp"
 #include "dxmt_occlusion_query.hpp"
 #include "dxmt_presenter.hpp"
+#include "wsi_platform.hpp"
 #include <cstdint>
 #include <cfloat>
 
 namespace dxmt {
 
-ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Device device) :
+ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Device device, InternalCommandLibrary &lib) :
+    emulated_cmd(device, lib, *this),
+    clear_rt_cmd(device, lib, *this),
     device_(device),
     queue_(queue) {
   dummy_sampler_info_.support_argument_buffers = true;
@@ -27,7 +30,7 @@ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Devic
   dummy_sampler_info_.max_anisotroy = 1;
   dummy_sampler_info_.lod_average = false;
   dummy_sampler_ = device.newSamplerState(dummy_sampler_info_);
-  dummy_cbuffer_host_ = _aligned_malloc(65536, DXMT_PAGE_SIZE);
+  dummy_cbuffer_host_ = wsi::aligned_malloc(65536, DXMT_PAGE_SIZE);
   dummy_cbuffer_info_.length = 65536;
   dummy_cbuffer_info_.memory.set(dummy_cbuffer_host_);
   dummy_cbuffer_info_.options = WMTResourceOptionCPUCacheModeWriteCombined | WMTResourceStorageModeShared |
@@ -39,7 +42,7 @@ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Devic
 
 ArgumentEncodingContext::~ArgumentEncodingContext() {
   free(cpu_buffer_);
-  _aligned_free(dummy_cbuffer_host_);
+  wsi::aligned_free(dummy_cbuffer_host_);
 };
 
 template void ArgumentEncodingContext::encodeVertexBuffers<PipelineKind::Ordinary>(uint32_t slot_mask, uint64_t argument_buffer_offset);
@@ -781,7 +784,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           encoder.useResource(task.dispatch_arguments_buffer, WMTResourceUsageWrite, WMTRenderStageVertex);
         }
         tasks_data[task_count - 1].end_of_command = 1;
-        queue_.emulated_cmd.MarshalGSDispatchArguments(encoder, task_data_buffer, task_data_buffer_offset);
+        emulated_cmd.MarshalGSDispatchArguments(encoder, task_data_buffer, task_data_buffer_offset);
         encoder.memoryBarrier(
             WMTBarrierScopeBuffers, WMTRenderStageVertex,
             WMTRenderStageVertex | WMTRenderStageMesh | WMTRenderStageObject
