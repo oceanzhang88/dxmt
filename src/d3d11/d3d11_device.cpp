@@ -22,7 +22,7 @@
 #include "dxmt_format.hpp"
 #include "dxmt_tasks.hpp"
 #include "ftl.hpp"
-#include "mtld11_resource.hpp"
+#include "d3d11_resource.hpp"
 #include "thread.hpp"
 #include "dxgi_object.hpp"
 #include <memory>
@@ -30,6 +30,7 @@
 #include <thread>
 #include <unordered_map>
 #include "d3d11_4.h"
+#include "util_win32_compat.h"
 
 namespace dxmt {
 
@@ -139,8 +140,12 @@ public:
       case D3D11_USAGE_DEFAULT:
       case D3D11_USAGE_IMMUTABLE:
         return CreateDeviceTexture1D(this, pDesc, pInitialData, ppTexture1D);
-      case D3D11_USAGE_DYNAMIC:
+      case D3D11_USAGE_DYNAMIC: {
+        HRESULT hr = CreateDynamicLinearTexture1D(this, pDesc, pInitialData, ppTexture1D);
+        if (SUCCEEDED(hr))
+          return hr;
         return CreateDynamicTexture1D(this, pDesc, pInitialData, ppTexture1D);
+      }
       case D3D11_USAGE_STAGING:
         if (pDesc->BindFlags != 0) {
           return E_INVALIDARG;
@@ -884,8 +889,12 @@ public:
       case D3D11_USAGE_DEFAULT:
       case D3D11_USAGE_IMMUTABLE:
         return CreateDeviceTexture2D(this, pDesc, pInitialData, ppTexture2D);
-      case D3D11_USAGE_DYNAMIC:
+      case D3D11_USAGE_DYNAMIC: {
+        HRESULT hr = CreateDynamicLinearTexture2D(this, pDesc, pInitialData, ppTexture2D);
+        if (SUCCEEDED(hr))
+          return hr;
         return CreateDynamicTexture2D(this, pDesc, pInitialData, ppTexture2D);
+      }
       case D3D11_USAGE_STAGING:
         if (pDesc->BindFlags != 0) {
           return E_INVALIDARG;
@@ -917,8 +926,7 @@ public:
       case D3D11_USAGE_IMMUTABLE:
         return CreateDeviceTexture3D(this, pDesc, pInitialData, ppTexture3D);
       case D3D11_USAGE_DYNAMIC:
-        ERR("dynamic texture 3d not supported yet");
-        return E_NOTIMPL;
+        return CreateDynamicTexture3D(this, pDesc, pInitialData, ppTexture3D);
       case D3D11_USAGE_STAGING:
         if (pDesc->BindFlags != 0) {
           return E_INVALIDARG;

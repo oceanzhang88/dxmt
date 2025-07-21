@@ -8,7 +8,7 @@
 #include "d3d11_view.hpp"
 #include "dxmt_binding_set.hpp"
 #include "log/log.hpp"
-#include "mtld11_resource.hpp"
+#include "d3d11_resource.hpp"
 #include "util_string.hpp"
 
 namespace dxmt {
@@ -123,6 +123,8 @@ struct D3D11OutputMergerStageState {
   // state derived from valid RTV/DSV
   UINT SampleCount = 1;
   UINT ArrayLength = 0;
+  UINT RenderTargetWidth = 0;
+  UINT RenderTargetHeight = 0;
 };
 
 struct STREAM_OUTPUT_BUFFER_B {

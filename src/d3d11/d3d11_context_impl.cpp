@@ -22,9 +22,10 @@ since it is for internal use only
 #include "dxmt_format.hpp"
 #include "dxmt_ring_bump_allocator.hpp"
 #include "dxmt_staging.hpp"
-#include "mtld11_resource.hpp"
+#include "d3d11_resource.hpp"
 #include "util_flags.hpp"
 #include "util_math.hpp"
+#include "util_win32_compat.h"
 
 namespace dxmt {
 
@@ -464,7 +465,7 @@ public:
       DstSubresource(DstSubresource),
       DstFormat(Dst_.FormatDescription) {
 
-    if (DstFormat.PixelFormat == WMTPixelFormatInvalid)
+    if (DstFormat.PixelFormat == WMTPixelFormatInvalid || DstFormat.BytesPerTexel == 0)
       return;
 
     switch (Dst_.Dimension) {
@@ -822,8 +823,8 @@ public:
       });
       for (unsigned i = 0; i < NumRects; i++) {
         auto rect = pRect[i];
-        uint32_t rect_offset_x = std::max(rect.left, 0l);
-        uint32_t rect_offset_y = std::max(rect.top, 0l);
+        uint32_t rect_offset_x = std::max(rect.left, (LONG)0);
+        uint32_t rect_offset_y = std::max(rect.top, (LONG)0);
         int32_t rect_width = rect.right - rect_offset_x;
         int32_t rect_height = rect.bottom - rect_offset_y;
         if (rect_height <= 0 || rect_width <= 0)
@@ -863,8 +864,8 @@ public:
       });
       for (unsigned i = 0; i < NumRects; i++) {
         auto rect = pRect[i];
-        uint32_t rect_offset_x = std::max(rect.left, 0l);
-        uint32_t rect_offset_y = std::max(rect.top, 0l);
+        uint32_t rect_offset_x = std::max(rect.left, (LONG)0);
+        uint32_t rect_offset_y = std::max(rect.top, (LONG)0);
         int32_t rect_width = rect.right - rect_offset_x;
         int32_t rect_height = rect.bottom - rect_offset_y;
         if (rect_height <= 0 || rect_width <= 0)
@@ -898,7 +899,12 @@ public:
       }
       SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
       EmitOP([tex = srv->texture(), viewId = srv->viewId()](ArgumentEncodingContext &enc) {
-        WMT::Texture texture = enc.access(tex, viewId, DXMT_ENCODER_RESOURCE_ACESS_READ | DXMT_ENCODER_RESOURCE_ACESS_WRITE).texture;
+        // workaround: mipmap generation of a8unorm is borked, so use a r8unorm view
+        auto fixedViewId = viewId;
+        if (tex->pixelFormat(viewId) == WMTPixelFormatA8Unorm) {
+          fixedViewId = tex->checkViewUseFormat(viewId, WMTPixelFormatR8Unorm);
+        }
+        WMT::Texture texture = enc.access(tex, fixedViewId, DXMT_ENCODER_RESOURCE_ACESS_READ | DXMT_ENCODER_RESOURCE_ACESS_WRITE).texture;
         if (texture.mipmapLevelCount() > 1) {
           auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_generate_mipmaps>();
           cmd.type = WMTBlitCommandGenerateMipmaps;
@@ -2393,42 +2399,50 @@ public:
 
     // FIXME: static_cast? but I don't really want a com_cast
     auto dsv = static_cast<IMTLD3D11DepthStencilView *>(pDepthStencilView);
-    UINT render_target_array_length = 0;
+    UINT render_target_array_length = 0, sample_count = 1, width = 0, height = 0;
 
     if (dsv) {
       ref = &dsv->GetAttachmentDesc();
       render_target_array_length = ref->RenderTargetArrayLength;
+      sample_count = ref->SampleCount;
+      width = ref->Width;
+      height = ref->Height;
     }
 
     for (unsigned i = 0; i < NumRTVs; i++) {
       auto rtv = static_cast<IMTLD3D11RenderTargetView *>(ppRenderTargetViews[i]);
       if (rtv) {
-        // TODO: render target type and size should be checked as well
+        // TODO: render target type should be checked as well
         if (ref) {
           auto &props = rtv->GetAttachmentDesc();
-          if (props.SampleCount != ref->SampleCount)
+          if (props.SampleCount != sample_count)
             return false;
-          if (props.RenderTargetArrayLength != ref->RenderTargetArrayLength) {
+          if (props.RenderTargetArrayLength != render_target_array_length) {
             // array length can be different only if either is 0 or 1
-            if (std::max(props.RenderTargetArrayLength, ref->RenderTargetArrayLength) != 1)
+            if (std::max(props.RenderTargetArrayLength, render_target_array_length) != 1)
               return false;
           }
+          // TODO: check all RTVs have the same size
+          if (width < props.Width || height < props.Height)
+            return false;
           // render_target_array_length will be 1 only if all render targets are array
           render_target_array_length = std::min(render_target_array_length, props.RenderTargetArrayLength);
+          width = std::min(width, props.Width);
+          height = std::min(height, props.Height);
         } else {
           ref = &rtv->GetAttachmentDesc();
           render_target_array_length = ref->RenderTargetArrayLength;
+          sample_count = ref->SampleCount;
+          width = ref->Width;
+          height = ref->Height;
         }
       }
     }
 
-    if (ref) {
-      state_.OutputMerger.SampleCount = ref->SampleCount;
-      state_.OutputMerger.ArrayLength = render_target_array_length;
-    } else {
-      state_.OutputMerger.SampleCount = 1;
-      state_.OutputMerger.ArrayLength = 0;
-    }
+    state_.OutputMerger.SampleCount = sample_count;
+    state_.OutputMerger.ArrayLength = render_target_array_length;
+    state_.OutputMerger.RenderTargetWidth = width;
+    state_.OutputMerger.RenderTargetHeight = height;
 
     return true;
   };
@@ -3725,6 +3739,36 @@ public:
     }
   }
 
+  void
+  UpdateTexture(
+      TextureUpdateCommand &&cmd, Rc<Buffer> &&src, UINT SrcRowPitch, UINT SrcDepthPitch
+  ) {
+    if (cmd.Invalid)
+      return;
+
+    std::lock_guard<mutex_t> lock(mutex);
+
+    if (auto dst = GetTexture(cmd.pDst)) {
+
+      SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+      EmitOP([=, src = std::move(src), dst = std::move(dst), cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
+        auto [src_buffer, src_offset] = enc.access(src, DXMT_ENCODER_RESOURCE_ACESS_READ);
+        auto texture = enc.access(dst, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+        auto &cmd_cptex = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
+        cmd_cptex.type = WMTBlitCommandCopyFromBufferToTexture;
+        cmd_cptex.src = src_buffer->buffer();
+        cmd_cptex.src_offset = src_offset;
+        cmd_cptex.bytes_per_row = SrcRowPitch;
+        cmd_cptex.bytes_per_image = SrcDepthPitch;
+        cmd_cptex.size = cmd.DstSize;
+        cmd_cptex.dst = texture;
+        cmd_cptex.slice = cmd.Dst.ArraySlice;
+        cmd_cptex.level = cmd.Dst.MipLevel;
+        cmd_cptex.origin = cmd.DstOrigin;
+      });
+    }
+  }
+
 #pragma endregion
 
 #pragma region CommandEncoder Maintain State
@@ -3917,8 +3961,8 @@ public:
       };
       // auto &dsv = state_.OutputMerger.DSV;
       DEPTH_STENCIL_STATE dsv_info;
-      uint32_t uav_only_render_target_width = 0;
-      uint32_t uav_only_render_target_height = 0;
+      uint32_t render_target_width = state_.OutputMerger.RenderTargetWidth;
+      uint32_t render_target_height = state_.OutputMerger.RenderTargetHeight;
       bool uav_only = false;
       uint32_t uav_only_sample_count = 0;
       if (state_.OutputMerger.DSV) {
@@ -3935,10 +3979,10 @@ public:
         IMTLD3D11RasterizerState *state =
             state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState : default_rasterizer_state;
         auto &viewport = state_.Rasterizer.viewports[0];
-        uav_only_render_target_width = viewport.Width;
-        uav_only_render_target_height = viewport.Height;
+        render_target_width = viewport.Width;
+        render_target_height = viewport.Height;
         uav_only_sample_count = state->UAVOnlySampleCount();
-        if (!(uav_only_render_target_width && uav_only_render_target_height)) {
+        if (!(render_target_width && render_target_height)) {
           ERR("uav only rendering is enabled but viewport is empty");
           return false;
         }
@@ -3949,7 +3993,7 @@ public:
       allocated_encoder_argbuf_size_ = allocated_encoder_argbuf_size.get();
 
       EmitST([rtvs = std::move(rtvs), dsv = std::move(dsv_info), effective_render_target, uav_only,
-            uav_only_render_target_height, uav_only_render_target_width, uav_only_sample_count,
+            render_target_height, render_target_width, uav_only_sample_count,
             render_target_array, encoder_argbuf_size = std::move(allocated_encoder_argbuf_size)](ArgumentEncodingContext &ctx) {
         auto pool = WMT::MakeAutoreleasePool();
         uint32_t dsv_planar_flags = DepthStencilPlanarFlags(dsv.PixelFormat);
@@ -3985,17 +4029,12 @@ public:
         }
         if (effective_render_target == 0) {
           if (uav_only) {
-            info.render_target_height = uav_only_render_target_height;
-            info.render_target_width = uav_only_render_target_width;
             info.default_raster_sample_count = uav_only_sample_count;
-          } else {
-            D3D11_ASSERT(dsv_planar_flags);
-            auto dsv_tex = dsv.Texture->view(dsv.viewId);
-            info.render_target_height = dsv_tex.height();
-            info.render_target_width = dsv_tex.width();
           }
         }
 
+        info.render_target_height = render_target_height;
+        info.render_target_width = render_target_width;
         info.render_target_array_length = render_target_array;
 
         for (auto &rtv : rtvs.span()) {
@@ -4367,23 +4406,23 @@ public:
       });
     }
     if (dirty_state.any(DirtyState::Scissors)) {
+      auto render_target_width = state_.OutputMerger.RenderTargetWidth;
+      auto render_target_height = state_.OutputMerger.RenderTargetHeight;
       auto scissors = AllocateCommandData<WMTScissorRect>(state_.Rasterizer.NumViewports);
       for (unsigned i = 0; i < state_.Rasterizer.NumViewports; i++) {
         if (allow_scissor) {
           if (i < state_.Rasterizer.NumScissorRects) {
-            auto &d3dRect = state_.Rasterizer.scissor_rects[i];
-            scissors[i] = {
-                (UINT)d3dRect.left, (UINT)d3dRect.top, (UINT)d3dRect.right - d3dRect.left,
-                (UINT)d3dRect.bottom - d3dRect.top
-            };
+            auto &d3d_rect = state_.Rasterizer.scissor_rects[i];
+            LONG left = std::clamp(d3d_rect.left, (LONG)0, (LONG)render_target_width);
+            LONG top = std::clamp(d3d_rect.top, (LONG)0, (LONG)render_target_height);
+            LONG right = std::clamp(d3d_rect.right, left, (LONG)render_target_width);
+            LONG bottom = std::clamp(d3d_rect.bottom, top, (LONG)render_target_height);
+            scissors[i] = {uint32_t(left), uint32_t(top), uint32_t(right - left), uint32_t(bottom - top)};
           } else {
             scissors[i] = {0, 0, 0, 0};
           }
         } else {
-          auto &d3dViewport = state_.Rasterizer.viewports[i];
-          scissors[i] = {
-              (UINT)d3dViewport.TopLeftX, (UINT)d3dViewport.TopLeftY, (UINT)d3dViewport.Width, (UINT)d3dViewport.Height
-          };
+          scissors[i] = {0, 0, render_target_width, render_target_height};
         }
       }
       EmitST([scissors = std::move(scissors)](ArgumentEncodingContext& enc) {
@@ -4831,8 +4870,8 @@ struct used_dynamic_buffer {
   bool latest;
 };
 
-struct used_dynamic_texture {
-  Rc<DynamicTexture> texture;
+struct used_dynamic_lineartexture {
+  Rc<DynamicLinearTexture> texture;
   Rc<TextureAllocation> allocation;
   bool latest;
 };
@@ -4885,10 +4924,10 @@ public:
       buffer.buffer->recycle(current_seq_id, std::move(buffer.allocation));
       used_dynamic_buffers.pop_back();
     }
-    while (!used_dynamic_textures.empty()) {
-      auto &texture = used_dynamic_textures.back();
+    while (!used_dynamic_lineartextures.empty()) {
+      auto &texture = used_dynamic_lineartextures.back();
       texture.texture->recycle(current_seq_id, std::move(texture.allocation));
-      used_dynamic_textures.pop_back();
+      used_dynamic_lineartextures.pop_back();
     }
     read_staging_resources.clear();
     written_staging_resources.clear();
@@ -4972,7 +5011,7 @@ public:
   bool promote_flush = false;
 
   std::vector<used_dynamic_buffer> used_dynamic_buffers;
-  std::vector<used_dynamic_texture> used_dynamic_textures;
+  std::vector<used_dynamic_lineartexture> used_dynamic_lineartextures;
   std::vector<Rc<StagingResource>> read_staging_resources;
   std::vector<Rc<StagingResource>> written_staging_resources;
   uint32_t visibility_query_count = 0;
