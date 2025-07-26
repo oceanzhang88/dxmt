@@ -3510,6 +3510,19 @@ public:
         });
         promote_flush = true;
       } else if (auto src = GetTexture(cmd.pSrc)) {
+        if (cmd.DstFormat.Flag & MTL_DXGI_FORMAT_EMULATED_LINEAR_DEPTH_STENCIL) {
+          InvalidateCurrentPass(true);
+          UseCopyDestination(staging_dst);
+          EmitOP([src_ = std::move(src), dst_ = std::move(staging_dst),
+                  cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
+            enc.blit_depth_stencil_cmd.copyFromTexture(
+                src_, cmd.Src.MipLevel, cmd.Src.ArraySlice, dst_->buffer(), 0, dst_->length, dst_->bytesPerRow,
+                dst_->bytesPerImage, cmd.DstFormat.Flag & MTL_DXGI_FORMAT_EMULATED_D24
+            );
+          });
+          promote_flush = true;
+          return;
+        }
         SwitchToBlitEncoder(CommandBufferState::ReadbackBlitEncoderActive);
         UseCopyDestination(staging_dst);
         EmitOP([src_ = std::move(src), dst_ = std::move(staging_dst),
@@ -3536,6 +3549,18 @@ public:
       }
     } else if (auto dst = GetTexture(cmd.pDst)) {
       if (auto staging_src = GetStagingResource(cmd.pSrc, cmd.SrcSubresource)) {
+        if (cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_EMULATED_LINEAR_DEPTH_STENCIL) {
+          InvalidateCurrentPass(true);
+          UseCopySource(staging_src);
+          EmitOP([dst_ = std::move(dst), src_ = std::move(staging_src),
+                  cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
+            enc.blit_depth_stencil_cmd.copyFromBuffer(
+                src_->buffer(), 0, src_->length, src_->bytesPerRow, src_->bytesPerImage, dst_, cmd.Dst.MipLevel,
+                cmd.Dst.ArraySlice, cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_EMULATED_D24
+            );
+          });
+          return;
+        }
         // copy from staging to default
         SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
         UseCopySource(staging_src);
